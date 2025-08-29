@@ -1,34 +1,35 @@
 import os
 from dotenv import load_dotenv
 from pinecone import Pinecone, ServerlessSpec
-from sentence_transformers import SentenceTransformer, CrossEncoder
 from groq import Groq
+import cohere
 
 load_dotenv()
-# print("Environment loaded")  # debug
+
 
 class RAGPipeline:
     def __init__(self):
-        # setup pinecone
+        # pinecone setup - 
         self.pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
-        self.indexName = 'predusk-assessment'
+        self.index_name = 'predusk-assessment' 
+        
+        # check if index exists, create if not
         existing_indexes = self.pc.list_indexes().names()
-        if self.indexName not in existing_indexes:
-            # print("Creating new index...")  # debug
+        if self.index_name not in existing_indexes:
+            print(f"Creating new index: {self.index_name}")  
             self.pc.create_index(
-                name=self.indexName,
-                dimension=384,
+                name=self.index_name,
+                dimension=1024,  # cohere embed-english-light-v3.0 
                 metric='cosine',
                 spec=ServerlessSpec(cloud='aws', region='us-east-1')
             )
-        self.index = self.pc.Index(self.indexName)
+        self.index = self.pc.Index(self.index_name)
 
-        # load models
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        # cohere for embeddings 
+        self.cohere = cohere.Client(os.getenv('COHERE_API_KEY'))
         
-        # groq client
-        self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+        # groq for llm - way faster than openai
+        self.groq = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
     def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150):
         chunks = []
@@ -38,7 +39,7 @@ class RAGPipeline:
         while start_pos < text_len:
             end_pos = min(start_pos + chunk_size, text_len)
             
-            # Try to break at sentence boundary
+            
             if end_pos < text_len:
                 # Look for sentence endings within last 100 chars
                 search_start = max(end_pos - 100, start_pos)
@@ -65,12 +66,20 @@ class RAGPipeline:
         # print(f"Created {len(chunks)} chunks")  # debug
         return chunks
 
+    def _get_embedding(self, text: str):
+        response = self.cohere.embed(
+            texts=[text],
+            model="embed-english-light-v3.0",
+            input_type="search_document"
+        )
+        return response.embeddings[0]
+
     def upsert_text(self, text: str, document_id: str = 'user_text'):
         text_chunks = self._chunk_text(text)
         vector_list = []
 
         for idx, chunk in enumerate(text_chunks):
-            embedding_vector = self.embedding_model.encode(chunk).tolist()
+            embedding_vector = self._get_embedding(chunk)
             chunk_metadata = {
                 'source_text': chunk, 
                 'document_id': document_id,
@@ -87,8 +96,28 @@ class RAGPipeline:
             self.index.upsert(vectors=vector_list)
         return len(vector_list)
 
+    def _rerank_results(self, query: str, passages: list):
+
+        scores = []
+        for passage in passages:
+            # Basic keyword overlap scoring
+            query_words = set(query.lower().split())
+            passage_words = set(passage.lower().split())
+            overlap = len(query_words.intersection(passage_words))
+            score = overlap / max(len(query_words), 1)
+            scores.append(score)
+        return scores
+
+    def _get_query_embedding(self, text: str):
+        response = self.cohere.embed(
+            texts=[text],
+            model="embed-english-light-v3.0",
+            input_type="search_query"
+        )
+        return response.embeddings[0]
+
     def query(self, query: str, document_id: str = 'user_text'):
-        queryEmbedding = self.embedding_model.encode(query).tolist()
+        queryEmbedding = self._get_query_embedding(query)
 
         # retrieve more candidates for reranking
         search_results = self.index.query(
@@ -103,17 +132,13 @@ class RAGPipeline:
             return "Sorry, I couldn't find relevant information to answer your question.", []
 
         # rerank the results
-        query_pairs = []
-        for match in matches:
-            pair = [query, match['metadata']['source_text']]
-            query_pairs.append(pair)
-        
-        rerank_scores = self.reranker.predict(query_pairs)
+        passages = [match['metadata']['source_text'] for match in matches]
+        rerank_scores = self._rerank_results(query, passages)
         
         # combine and sort by rerank score
         scored_results = []
-        for i in range(len(rerank_scores)):
-            scored_results.append((rerank_scores[i], matches[i]))
+        for i, score in enumerate(rerank_scores):
+            scored_results.append((score, matches[i]))
         
         scored_results.sort(key=lambda x: x[0], reverse=True)
 
@@ -133,19 +158,18 @@ class RAGPipeline:
             }
             citation_list.append(citation_data)
         
-        system_prompt = f'''You are a helpful, clear, and human-like assistant. 
-Explain answers in a short, easy-to-understand way. 
-Don’t sound like a textbook or academic paper. 
-If helpful, break things into steps or give analogies. 
-Still cite sources [1], [2] but keep the flow natural.
+        system_prompt = f'''Answer the question using only the provided context. Be conversational and use simple analogies when helpful. Always include citations [1], [2] in your response.
+
+If the context doesn't contain the answer, say "I don't have information about that in the provided text."
+
 Context:
 {context_text}
 
-Query: {query}
+Question: {query}
 
 Answer:'''
 
-        llm_response = self.groq_client.chat.completions.create(
+        llm_response = self.groq.chat.completions.create(
             messages=[{'role': 'user', 'content': system_prompt}],
             model='llama3-8b-8192',
         )

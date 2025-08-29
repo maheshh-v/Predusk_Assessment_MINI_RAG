@@ -110,7 +110,7 @@
                             <h4>Answer:</h4>
                             <p>${responseData.answer}</p>
                             ${citationsHtml}
-                            <span class="time-info">Processing time: ${responseData.processing_time}s</span>
+                            <span class="time-info">Processing time: ${responseData.processing_time}s | Tokens: ${responseData.tokens_used} | Cost: ${responseData.estimated_cost}</span>
                         </div>
                     `;
                 } else {
