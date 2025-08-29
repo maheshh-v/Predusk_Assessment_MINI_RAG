@@ -30,8 +30,7 @@ def home():
     static_file = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
     return FileResponse(static_file)
 
-# Vercel handler
-handler = app
+
 
 @app.post('/upload')
 def upload_text(request: TextUpload):
