@@ -1,0 +1,19 @@
+# keep secrets out of git
+.env
+
+# python stuff
+__pycache__/
+*.pyc
+venv/
+env/
+
+# my editor files
+.vscode/
+.idea/
+
+# vercel deployment
+.vercel
+
+# random OS files
+.DS_Store
+Thumbs.db

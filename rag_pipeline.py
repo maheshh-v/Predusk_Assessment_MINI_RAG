@@ -1,0 +1,155 @@
+import os
+from dotenv import load_dotenv
+from pinecone import Pinecone, ServerlessSpec
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from groq import Groq
+
+load_dotenv()
+# print("Environment loaded")  # debug
+
+class RAGPipeline:
+    def __init__(self):
+        # setup pinecone
+        self.pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+        self.indexName = 'predusk-assessment'
+        existing_indexes = self.pc.list_indexes().names()
+        if self.indexName not in existing_indexes:
+            # print("Creating new index...")  # debug
+            self.pc.create_index(
+                name=self.indexName,
+                dimension=384,
+                metric='cosine',
+                spec=ServerlessSpec(cloud='aws', region='us-east-1')
+            )
+        self.index = self.pc.Index(self.indexName)
+
+        # load models
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        
+        # groq client
+        self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+
+    def _chunk_text(self, text: str, chunk_size: int = 1000, overlap: int = 150):
+        chunks = []
+        start_pos = 0
+        text_len = len(text)
+        
+        while start_pos < text_len:
+            end_pos = min(start_pos + chunk_size, text_len)
+            
+            # Try to break at sentence boundary
+            if end_pos < text_len:
+                # Look for sentence endings within last 100 chars
+                search_start = max(end_pos - 100, start_pos)
+                found_sentence = False
+                for i in range(end_pos, search_start, -1):
+                    if text[i-1] in '.!?\n':
+                        end_pos = i
+                        found_sentence = True
+                        break
+                
+                # If no sentence boundary found, avoid cutting words in half
+                if not found_sentence and end_pos < text_len:
+                    while end_pos > start_pos and text[end_pos] != ' ':
+                        end_pos -= 1
+            
+            chunk_text = text[start_pos:end_pos].strip()
+            if len(chunk_text) > 0:
+                chunks.append(chunk_text)
+            
+            if end_pos >= text_len:
+                break
+            start_pos = end_pos - overlap
+        
+        # print(f"Created {len(chunks)} chunks")  # debug
+        return chunks
+
+    def upsert_text(self, text: str, document_id: str = 'user_text'):
+        text_chunks = self._chunk_text(text)
+        vector_list = []
+
+        for idx, chunk in enumerate(text_chunks):
+            embedding_vector = self.embedding_model.encode(chunk).tolist()
+            chunk_metadata = {
+                'source_text': chunk, 
+                'document_id': document_id,
+                'chunk_index': idx,
+                'source': 'user_upload',
+                'title': document_id,
+                'position': idx
+            }
+            vectorId = f'{document_id}-chunk-{idx}'
+            vector_data = {'id': vectorId, 'values': embedding_vector, 'metadata': chunk_metadata}
+            vector_list.append(vector_data)
+
+        if len(vector_list) > 0:
+            self.index.upsert(vectors=vector_list)
+        return len(vector_list)
+
+    def query(self, query: str, document_id: str = 'user_text'):
+        queryEmbedding = self.embedding_model.encode(query).tolist()
+
+        # retrieve more candidates for reranking
+        search_results = self.index.query(
+            vector=queryEmbedding,
+            top_k=10,
+            include_metadata=True,
+            filter={'document_id': document_id}
+        )
+        
+        matches = search_results['matches']
+        if not matches:
+            return "Sorry, I couldn't find relevant information to answer your question.", []
+
+        # rerank the results
+        query_pairs = []
+        for match in matches:
+            pair = [query, match['metadata']['source_text']]
+            query_pairs.append(pair)
+        
+        rerank_scores = self.reranker.predict(query_pairs)
+        
+        # combine and sort by rerank score
+        scored_results = []
+        for i in range(len(rerank_scores)):
+            scored_results.append((rerank_scores[i], matches[i]))
+        
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+
+        # build context from top 3
+        context_text = ''
+        citation_list = []
+        top_results = scored_results[:3]
+        
+        for idx, (score, match) in enumerate(top_results):
+            citation_num = idx + 1
+            source_text = match['metadata']['source_text']
+            context_text += f'[{citation_num}] {source_text}\n\n'
+            
+            citation_data = {
+                'citation_num': citation_num,
+                'source_text': source_text
+            }
+            citation_list.append(citation_data)
+        
+        system_prompt = f'''You are a helpful, clear, and human-like assistant. 
+Explain answers in a short, easy-to-understand way. 
+Don’t sound like a textbook or academic paper. 
+If helpful, break things into steps or give analogies. 
+Still cite sources [1], [2] but keep the flow natural.
+Context:
+{context_text}
+
+Query: {query}
+
+Answer:'''
+
+        llm_response = self.groq_client.chat.completions.create(
+            messages=[{'role': 'user', 'content': system_prompt}],
+            model='llama3-8b-8192',
+        )
+        final_answer = llm_response.choices[0].message.content
+
+        return final_answer, citation_list
+

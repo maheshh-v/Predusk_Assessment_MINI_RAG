@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pinecone
+sentence-transformers
+groq
+python-dotenv
+torch
+pydantic
+python-multipart
