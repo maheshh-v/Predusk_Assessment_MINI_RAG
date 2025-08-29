@@ -1,6 +1,6 @@
-# Smart Document Q&A System
+# MINI RAG System
 
-Built by Mahesh for the Predusk AI Engineer assessment. After exploring different approaches, I settled on this RAG pipeline that lets you upload text and ask questions with proper citations.
+Built for the Predusk AI Engineer assessment. Created RAG pipeline that lets you upload text and ask questions with proper citations.
 
 **Live Demo:** https://mini-rag-gzzo.onrender.com/
 
